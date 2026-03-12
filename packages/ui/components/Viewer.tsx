@@ -209,6 +209,21 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     onCodeBlockClick: handlePinpointCodeBlockClick,
   });
 
+  // Suppress native context menu on touch devices (prevents cut/copy/paste overlay on mobile)
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const isTouchPrimary = window.matchMedia('(pointer: coarse)').matches;
+    if (!isTouchPrimary) return;
+
+    const handleContextMenu = (e: Event) => {
+      e.preventDefault();
+    };
+
+    container.addEventListener('contextmenu', handleContextMenu);
+    return () => container.removeEventListener('contextmenu', handleContextMenu);
+  }, []);
+
   // Detect when sticky action bar is "stuck" to show card background
   useEffect(() => {
     if (!stickyActions || !stickySentinelRef.current) return;
@@ -923,6 +938,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
         className={`w-full bg-card rounded-xl shadow-xl p-5 md:p-8 lg:p-10 xl:p-12 relative ${
           linkedDocInfo ? 'border-2 border-primary' : 'border border-border/50'
         } ${inputMethod === 'pinpoint' ? 'cursor-crosshair' : ''}`}
+        style={{ WebkitTouchCallout: 'none' } as React.CSSProperties}
       >
         {/* Repo info + plan diff badge + demo badge + linked doc badge - top left */}
         {(repoInfo || hasPreviousVersion || showDemoBadge || linkedDocInfo) && (
