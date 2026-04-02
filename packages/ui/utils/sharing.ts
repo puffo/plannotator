@@ -212,8 +212,8 @@ export function formatUrlSize(url: string): string {
 // Short URL support (paste-service backed)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PASTE_API = 'https://plannotator-paste.plannotator.workers.dev';
-const DEFAULT_SHARE_BASE = 'https://share.plannotator.ai';
+const DEFAULT_PASTE_API = import.meta.env.VITE_PASTE_API_URL || 'https://plannotator-paste.plannotator.workers.dev';
+const DEFAULT_SHARE_BASE = import.meta.env.VITE_SHARE_BASE_URL || 'https://share.plannotator.ai';
 
 /**
  * Create a short share URL by posting compressed plan data to the paste service.
