@@ -87,6 +87,8 @@ export interface GitlabMRMetadata {
   headBranch: string;
   baseSha: string;
   headSha: string;
+  /** Merge-base SHA — the common ancestor commit used to compute the MR diff. */
+  mergeBaseSha?: string;
   url: string;
 }
 
