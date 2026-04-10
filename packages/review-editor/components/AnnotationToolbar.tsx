@@ -2,9 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { ToolbarState } from '../hooks/useAnnotationToolbar';
 import { useTabIndent } from '../hooks/useTabIndent';
-import { formatLineRange } from '../utils/formatLineRange';
+import { formatLineRange, formatTokenContext } from '../utils/formatLineRange';
 import { AskAIInput } from './AskAIInput';
 import { SparklesIcon } from './SparklesIcon';
+import { ConventionalLabelPicker, type LabelDef } from './ConventionalLabelPicker';
+import type { ConventionalLabel, ConventionalDecoration } from '@plannotator/ui/types';
 import type { AIChatEntry } from '../hooks/useAIChat';
 import { useDraggable } from '@plannotator/ui/hooks/useDraggable';
 
@@ -23,6 +25,13 @@ interface AnnotationToolbarProps {
   onSubmit: () => void;
   onDismiss: () => void;
   onCancel: () => void;
+  // Conventional Comments
+  conventionalCommentsEnabled: boolean;
+  conventionalLabel: ConventionalLabel | null;
+  onConventionalLabelChange: (label: ConventionalLabel | null) => void;
+  decorations: ConventionalDecoration[];
+  onDecorationsChange: (decorations: ConventionalDecoration[]) => void;
+  enabledLabels?: LabelDef[];
   // AI props
   aiAvailable?: boolean;
   onAskAI?: (question: string) => void;
@@ -48,6 +57,12 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   onSubmit,
   onDismiss,
   onCancel,
+  conventionalCommentsEnabled,
+  conventionalLabel,
+  onConventionalLabelChange,
+  decorations,
+  onDecorationsChange,
+  enabledLabels,
   aiAvailable = false,
   onAskAI,
   isAILoading = false,
@@ -116,7 +131,11 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
         <div className="w-80">
           <div className="flex items-center justify-between mb-2" {...dragHandleProps}>
             <span className="text-xs text-muted-foreground">
-              {isEditing ? 'Edit annotation' : formatLineRange(toolbarState.range.start, toolbarState.range.end)}
+              {isEditing
+                ? 'Edit annotation'
+                : toolbarState.tokenSelection
+                  ? formatTokenContext(toolbarState.tokenSelection)
+                  : formatLineRange(toolbarState.range.start, toolbarState.range.end)}
             </span>
             <button
               onClick={onCancel}
@@ -128,6 +147,16 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
               </svg>
             </button>
           </div>
+
+          {conventionalCommentsEnabled && (
+            <ConventionalLabelPicker
+              selected={conventionalLabel}
+              decorations={decorations}
+              onSelect={onConventionalLabelChange}
+              onDecorationsChange={onDecorationsChange}
+              enabledLabels={enabledLabels}
+            />
+          )}
 
           <textarea
             value={commentText}

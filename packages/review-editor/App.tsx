@@ -3,7 +3,8 @@ import { type Origin, getAgentName } from '@plannotator/shared/agents';
 import { ThemeProvider, useTheme } from '@plannotator/ui/components/ThemeProvider';
 import { ConfirmDialog } from '@plannotator/ui/components/ConfirmDialog';
 import { Settings } from '@plannotator/ui/components/Settings';
-import { FeedbackButton, ApproveButton } from '@plannotator/ui/components/ToolbarButtons';
+import { FeedbackButton, ApproveButton, ExitButton } from '@plannotator/ui/components/ToolbarButtons';
+import { AgentReviewActions } from './components/AgentReviewActions';
 import { UpdateBanner } from '@plannotator/ui/components/UpdateBanner';
 import { storage } from '@plannotator/ui/utils/storage';
 import { CompletionOverlay } from '@plannotator/ui/components/CompletionOverlay';
@@ -18,7 +19,7 @@ import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/u
 import { getAIProviderSettings, saveAIProviderSettings, getPreferredModel } from '@plannotator/ui/utils/aiProvider';
 import { AISetupDialog } from '@plannotator/ui/components/AISetupDialog';
 import { needsAISetup } from '@plannotator/ui/utils/aiSetup';
-import { CodeAnnotation, CodeAnnotationType, SelectedLineRange } from '@plannotator/ui/types';
+import { CodeAnnotation, CodeAnnotationType, SelectedLineRange, TokenAnnotationMeta, ConventionalLabel, ConventionalDecoration } from '@plannotator/ui/types';
 import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
 import { useCodeAnnotationDraft } from '@plannotator/ui/hooks/useCodeAnnotationDraft';
 import { useGitAdd } from './hooks/useGitAdd';
@@ -36,8 +37,9 @@ import { ReviewHeaderMenu } from './components/ReviewHeaderMenu';
 import { ReviewSidebar } from './components/ReviewSidebar';
 import { FileTree } from './components/FileTree';
 import { DEMO_DIFF } from './demoData';
-import { exportReviewFeedback } from './utils/exportFeedback';
+import { exportReviewFeedback, formatConventionalPrefix } from './utils/exportFeedback';
 import { ReviewStateProvider, type ReviewState } from './dock/ReviewStateContext';
+import { JobLogsProvider } from './dock/JobLogsContext';
 import { reviewPanelComponents } from './dock/reviewPanelComponents';
 import { ReviewDockTabRenderer } from './dock/ReviewDockTabRenderer';
 import { usePRContext } from './hooks/usePRContext';
@@ -114,6 +116,7 @@ const ReviewApp: React.FC = () => {
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [pendingSelection, setPendingSelection] = useState<SelectedLineRange | null>(null);
   const [showExportModal, setShowExportModal] = useState(false);
+  const [showWorktreeDialog, setShowWorktreeDialog] = useState(false);
   const [openSettingsMenu, setOpenSettingsMenu] = useState(false);
   const [showNoAnnotationsDialog, setShowNoAnnotationsDialog] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -151,12 +154,15 @@ const ReviewApp: React.FC = () => {
   const [isWSL, setIsWSL] = useState(false);
   const [diffType, setDiffType] = useState<string>('uncommitted');
   const [gitContext, setGitContext] = useState<GitContext | null>(null);
+  const [agentCwd, setAgentCwd] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [isSendingFeedback, setIsSendingFeedback] = useState(false);
   const [isApproving, setIsApproving] = useState(false);
-  const [submitted, setSubmitted] = useState<'approved' | 'feedback' | false>(false);
+  const [isExiting, setIsExiting] = useState(false);
+  const [submitted, setSubmitted] = useState<'approved' | 'feedback' | 'exited' | false>(false);
   const [showApproveWarning, setShowApproveWarning] = useState(false);
+  const [showExitWarning, setShowExitWarning] = useState(false);
   const [sharingEnabled, setSharingEnabled] = useState(true);
   const [repoInfo, setRepoInfo] = useState<{ display: string; branch?: string } | null>(null);
 
@@ -617,6 +623,7 @@ const ReviewApp: React.FC = () => {
         origin?: Origin;
         diffType?: string;
         gitContext?: GitContext;
+        agentCwd?: string;
         sharingEnabled?: boolean;
         repoInfo?: { display: string; branch?: string };
         prMetadata?: PRMetadata;
@@ -644,6 +651,7 @@ const ReviewApp: React.FC = () => {
         if (data.origin) setOrigin(data.origin);
         if (data.diffType) setDiffType(data.diffType);
         if (data.gitContext) setGitContext(data.gitContext);
+        if (data.agentCwd) setAgentCwd(data.agentCwd);
         if (data.sharingEnabled !== undefined) setSharingEnabled(data.sharingEnabled);
         if (data.repoInfo) setRepoInfo(data.repoInfo);
         if (data.prMetadata) setPrMetadata(data.prMetadata);
@@ -682,7 +690,10 @@ const ReviewApp: React.FC = () => {
     type: CodeAnnotationType,
     text?: string,
     suggestedCode?: string,
-    originalCode?: string
+    originalCode?: string,
+    conventionalLabel?: ConventionalLabel,
+    decorations?: ConventionalDecoration[],
+    tokenMeta?: TokenAnnotationMeta
   ) => {
     if (!pendingSelection || !files[activeFileIndex]) return;
 
@@ -701,8 +712,15 @@ const ReviewApp: React.FC = () => {
       text,
       suggestedCode,
       originalCode,
+      ...(tokenMeta && {
+        charStart: tokenMeta.charStart,
+        charEnd: tokenMeta.charEnd,
+        tokenText: tokenMeta.tokenText,
+      }),
       createdAt: Date.now(),
       author: identity,
+      conventionalLabel,
+      decorations,
     };
 
     setAnnotations(prev => [...prev, newAnnotation]);
@@ -735,13 +753,18 @@ const ReviewApp: React.FC = () => {
     id: string,
     text?: string,
     suggestedCode?: string,
-    originalCode?: string
+    originalCode?: string,
+    conventionalLabel?: ConventionalLabel | null,
+    decorations?: ConventionalDecoration[],
   ) => {
     const ann = allAnnotationsRef.current.find(a => a.id === id);
-    const updates = {
+    const updates: Partial<CodeAnnotation> = {
       ...(text !== undefined && { text }),
       ...(suggestedCode !== undefined && { suggestedCode }),
       ...(originalCode !== undefined && { originalCode }),
+      // null clears the label; undefined means "not provided, keep existing"
+      ...(conventionalLabel !== undefined && { conventionalLabel: conventionalLabel ?? undefined }),
+      ...(decorations !== undefined && { decorations }),
     };
     if (ann?.source && externalAnnotations.some(e => e.id === id)) {
       updateExternalAnnotation(id, updates);
@@ -839,10 +862,12 @@ const ReviewApp: React.FC = () => {
     (path: string) => setViewedFiles(prev => new Set(prev).add(path)),
     [],
   );
-  const { stagedFiles, stagingFile, canStageFiles, stageFile, resetStagedFiles, stageError } = useGitAdd({
+  const { stagedFiles, stagingFile, canStageFiles: canStageRaw, stageFile, resetStagedFiles, stageError } = useGitAdd({
     activeDiffBase,
     onFileViewed: handleFileViewedFromStage,
   });
+  // Staging is never available in PR review mode — the server rejects it and the UI shouldn't offer it.
+  const canStageFiles = canStageRaw && !prMetadata;
 
   // Shared helper: fetch a diff switch and update state
   const fetchDiffSwitch = useCallback(async (fullDiffType: string) => {
@@ -970,6 +995,7 @@ const ReviewApp: React.FC = () => {
     isPRContextLoading,
     prContextError,
     fetchPRContext,
+    platformUser,
     openDiffFile,
   }), [
     files, activeFileIndex, diffStyle, diffOverflow, diffIndicators,
@@ -984,8 +1010,11 @@ const ReviewApp: React.FC = () => {
     aiAvailable, aiChat.messages, aiChat.isCreatingSession, aiChat.isStreaming,
     handleAskAI, handleViewAIResponse, handleClickAIMarker,
     aiHistoryForSelection, agentJobs.jobs, prMetadata, prContext,
-    isPRContextLoading, prContextError, fetchPRContext, openDiffFile,
+    isPRContextLoading, prContextError, fetchPRContext, platformUser, openDiffFile,
   ]);
+
+  // Separate context for high-frequency job logs — prevents re-rendering all panels on every SSE event
+  const jobLogsValue = useMemo(() => ({ jobLogs: agentJobs.jobLogs }), [agentJobs.jobLogs]);
 
   // Copy raw diff to clipboard
   const handleCopyDiff = useCallback(async () => {
@@ -1063,6 +1092,22 @@ const ReviewApp: React.FC = () => {
     }
   }, [totalAnnotationCount, feedbackMarkdown, allAnnotations]);
 
+  // Exit review session without sending any feedback
+  const handleExit = useCallback(async () => {
+    setIsExiting(true);
+    try {
+      const res = await fetch('/api/exit', { method: 'POST' });
+      if (res.ok) {
+        setSubmitted('exited');
+      } else {
+        throw new Error('Failed to exit');
+      }
+    } catch (error) {
+      console.error('Failed to exit review:', error);
+      setIsExiting(false);
+    }
+  }, []);
+
   // Approve without feedback (LGTM)
   const handleApprove = useCallback(async () => {
     setIsApproving(true);
@@ -1107,7 +1152,8 @@ const ReviewApp: React.FC = () => {
 
     // Inline file comments
     const fileComments = fileAnnotations.map(ann => {
-      let commentBody = ann.text ?? '';
+      const ccPrefix = formatConventionalPrefix(ann.conventionalLabel, ann.decorations);
+      let commentBody = ccPrefix + (ann.text ?? '');
       if (ann.suggestedCode) {
         commentBody += `\n\n\`\`\`suggestion\n${ann.suggestedCode}\n\`\`\``;
       }
@@ -1251,8 +1297,8 @@ const ReviewApp: React.FC = () => {
 
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (showExportModal || showNoAnnotationsDialog || showApproveWarning) return;
-      if (submitted || isSendingFeedback || isApproving || isPlatformActioning) return;
+      if (showExportModal || showNoAnnotationsDialog || showApproveWarning || showExitWarning) return;
+      if (submitted || isSendingFeedback || isApproving || isExiting || isPlatformActioning) return;
       if (!origin) return; // Demo mode
 
       e.preventDefault();
@@ -1280,9 +1326,9 @@ const ReviewApp: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
-    showExportModal, showNoAnnotationsDialog, showApproveWarning,
+    showExportModal, showNoAnnotationsDialog, showApproveWarning, showExitWarning,
     platformCommentDialog, platformGeneralComment,
-    submitted, isSendingFeedback, isApproving, isPlatformActioning,
+    submitted, isSendingFeedback, isApproving, isExiting, isPlatformActioning,
     origin, platformMode, platformUser, prMetadata, totalAnnotationCount,
     handleApprove, handleSendFeedback, handlePlatformAction
   ]);
@@ -1300,12 +1346,21 @@ const ReviewApp: React.FC = () => {
   return (
     <ThemeProvider defaultTheme="dark">
       <ReviewStateProvider value={reviewStateValue}>
+      <JobLogsProvider value={jobLogsValue}>
       <div className="h-screen flex flex-col bg-background overflow-hidden">
         {/* Header */}
-        <header className="h-12 flex items-center justify-between px-2 md:px-4 border-b border-border/50 bg-card/50 backdrop-blur-xl z-50">
+        <header className="py-1 flex items-center justify-between px-2 md:px-4 border-b border-border/50 bg-card/50 backdrop-blur-xl z-50">
           <div className="min-w-0 flex items-center gap-2 md:gap-3">
             {prMetadata ? (
               <div className="min-w-0 flex items-center gap-2 md:gap-3">
+                {prMetadata && (gitContext || agentCwd) && (
+                  <button
+                    onClick={() => setShowWorktreeDialog(true)}
+                    className="text-[10px] font-medium text-primary/80 bg-primary/10 hover:bg-primary/20 px-1.5 py-0.5 rounded transition-colors cursor-pointer"
+                  >
+                    worktree
+                  </button>
+                )}
                 <span
                   className="text-xs text-muted-foreground/60 inline-flex items-center gap-1 truncate max-w-[200px]"
                   title={displayRepo}
@@ -1324,6 +1379,17 @@ const ReviewApp: React.FC = () => {
                   <span className="font-mono whitespace-nowrap">{mrNumberLabel}</span>
                   <span className="truncate hidden md:inline">{prMetadata.title}</span>
                 </a>
+                <div className="hidden md:flex items-center gap-0.5 ml-1">
+                  <button onClick={() => handleOpenPRPanel('summary')} className="p-1 rounded text-muted-foreground/50 hover:text-foreground hover:bg-muted/30 transition-colors duration-150" title="PR Summary">
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                  </button>
+                  <button onClick={() => handleOpenPRPanel('comments')} className="p-1 rounded text-muted-foreground/50 hover:text-foreground hover:bg-muted/30 transition-colors duration-150" title="PR Comments">
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+                  </button>
+                  <button onClick={() => handleOpenPRPanel('checks')} className="p-1 rounded text-muted-foreground/50 hover:text-foreground hover:bg-muted/30 transition-colors duration-150" title="PR Checks">
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                  </button>
+                </div>
               </div>
             ) : repoInfo ? (
               <div className="min-w-0 flex items-center gap-2 md:gap-3">
@@ -1452,71 +1518,67 @@ const ReviewApp: React.FC = () => {
                   </div>
                 )}
 
-                {/* Send Feedback button — always the same label */}
-                <FeedbackButton
-                  onClick={() => {
-                    if (platformMode) {
-                      setPlatformGeneralComment('');
-                      setPlatformCommentDialog({ action: 'comment' });
-                    } else {
-                      handleSendFeedback();
-                    }
-                  }}
-                  disabled={
-                    isSendingFeedback || isApproving || isPlatformActioning ||
-                    (!platformMode && totalAnnotationCount === 0)
-                  }
-                  isLoading={isSendingFeedback || isPlatformActioning}
-                  muted={!platformMode && totalAnnotationCount === 0 && !isSendingFeedback && !isApproving && !isPlatformActioning}
-                  label={platformMode ? 'Post Comments' : 'Send Feedback'}
-                  loadingLabel={platformMode ? 'Posting...' : 'Sending...'}
-                  title={!platformMode && totalAnnotationCount === 0 ? "Add annotations to send feedback" : "Send feedback"}
-                />
-
-                {/* Approve button — always the same label */}
-                <div className="relative group/approve">
-                  <ApproveButton
-                    onClick={() => {
-                      if (platformMode) {
-                        if (platformUser && prMetadata?.author === platformUser) return;
-                        setPlatformGeneralComment('');
-                        setPlatformCommentDialog({ action: 'approve' });
-                      } else {
-                        if (totalAnnotationCount > 0) {
-                          setShowApproveWarning(true);
-                        } else {
-                          handleApprove();
-                        }
-                      }
-                    }}
-                    disabled={
-                      isSendingFeedback || isApproving || isPlatformActioning ||
-                      (platformMode && !!platformUser && prMetadata?.author === platformUser)
-                    }
-                    isLoading={isApproving}
-                    dimmed={!platformMode && totalAnnotationCount > 0}
-                    muted={platformMode && !!platformUser && prMetadata?.author === platformUser && !isSendingFeedback && !isApproving && !isPlatformActioning}
-                    title={
-                      platformMode && platformUser && prMetadata?.author === platformUser
-                        ? `You can't approve your own ${mrLabel}`
-                        : "Approve - no changes needed"
-                    }
+                {/* Agent mode: Close/SendFeedback flip + Approve */}
+                {!platformMode ? (
+                  <AgentReviewActions
+                    totalAnnotationCount={totalAnnotationCount}
+                    isSendingFeedback={isSendingFeedback}
+                    isApproving={isApproving}
+                    isExiting={isExiting}
+                    onSendFeedback={handleSendFeedback}
+                    onApprove={() => totalAnnotationCount > 0 ? setShowApproveWarning(true) : handleApprove()}
+                    onExit={() => totalAnnotationCount > 0 ? setShowExitWarning(true) : handleExit()}
                   />
-                  {/* Tooltip: own PR warning OR annotations-lost warning */}
-                  {platformMode && platformUser && prMetadata?.author === platformUser ? (
-                    <div className="absolute top-full right-0 mt-2 px-3 py-2 bg-popover border border-border rounded-lg shadow-xl text-xs text-foreground w-48 text-center opacity-0 invisible group-hover/approve:opacity-100 group-hover/approve:visible transition-all pointer-events-none z-50">
-                      <div className="absolute bottom-full right-4 border-4 border-transparent border-b-border" />
-                      <div className="absolute bottom-full right-4 mt-px border-4 border-transparent border-b-popover" />
-                      You can't approve your own {mrLabel === 'MR' ? 'merge request' : 'pull request'} on {platformLabel}.
+                ) : (
+                  <>
+                    {/* Platform mode: Close + Post Comments + Approve */}
+                    <ExitButton
+                      onClick={() => totalAnnotationCount > 0 ? setShowExitWarning(true) : handleExit()}
+                      disabled={isSendingFeedback || isApproving || isExiting || isPlatformActioning}
+                      isLoading={isExiting}
+                    />
+                    <FeedbackButton
+                      onClick={() => {
+                        setPlatformGeneralComment('');
+                        setPlatformCommentDialog({ action: 'comment' });
+                      }}
+                      disabled={isSendingFeedback || isApproving || isPlatformActioning}
+                      isLoading={isSendingFeedback || isPlatformActioning}
+                      label="Post Comments"
+                      shortLabel="Post"
+                      loadingLabel="Posting..."
+                      shortLoadingLabel="Posting..."
+                      title="Send feedback"
+                    />
+                    <div className="relative group/approve">
+                      <ApproveButton
+                        onClick={() => {
+                          if (platformUser && prMetadata?.author === platformUser) return;
+                          setPlatformGeneralComment('');
+                          setPlatformCommentDialog({ action: 'approve' });
+                        }}
+                        disabled={
+                          isSendingFeedback || isApproving || isPlatformActioning ||
+                          (!!platformUser && prMetadata?.author === platformUser)
+                        }
+                        isLoading={isApproving}
+                        muted={!!platformUser && prMetadata?.author === platformUser && !isSendingFeedback && !isApproving && !isPlatformActioning}
+                        title={
+                          platformUser && prMetadata?.author === platformUser
+                            ? `You can't approve your own ${mrLabel}`
+                            : "Approve - no changes needed"
+                        }
+                      />
+                      {platformUser && prMetadata?.author === platformUser && (
+                        <div className="absolute top-full right-0 mt-2 px-3 py-2 bg-popover border border-border rounded-lg shadow-xl text-xs text-foreground w-48 text-center opacity-0 invisible group-hover/approve:opacity-100 group-hover/approve:visible transition-all pointer-events-none z-50">
+                          <div className="absolute bottom-full right-4 border-4 border-transparent border-b-border" />
+                          <div className="absolute bottom-full right-4 mt-px border-4 border-transparent border-b-popover" />
+                          You can't approve your own {mrLabel === 'MR' ? 'merge request' : 'pull request'} on {platformLabel}.
+                        </div>
+                      )}
                     </div>
-                  ) : !platformMode && totalAnnotationCount > 0 ? (
-                    <div className="absolute top-full right-0 mt-2 px-3 py-2 bg-popover border border-border rounded-lg shadow-xl text-xs text-foreground w-56 text-center opacity-0 invisible group-hover/approve:opacity-100 group-hover/approve:visible transition-all pointer-events-none z-50">
-                      <div className="absolute bottom-full right-4 border-4 border-transparent border-b-border" />
-                      <div className="absolute bottom-full right-4 mt-px border-4 border-transparent border-b-popover" />
-                      Your {totalAnnotationCount} annotation{totalAnnotationCount !== 1 ? 's' : ''} won't be sent if you approve.
-                    </div>
-                  ) : null}
-                </div>
+                  </>
+                )}
               </>
             ) : (
               <button
@@ -1766,6 +1828,33 @@ const ReviewApp: React.FC = () => {
           />
         </div>
 
+        {/* Worktree info dialog */}
+        {(gitContext?.cwd || agentCwd) && prMetadata && (
+          <ConfirmDialog
+            isOpen={showWorktreeDialog}
+            onClose={() => setShowWorktreeDialog(false)}
+            title="Local Worktree"
+            wide
+            message={
+              <div className="space-y-3">
+                <p>This PR is checked out locally so review agents have full file access.</p>
+                <div>
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground/60 font-semibold">Path</span>
+                  <button
+                    onClick={() => navigator.clipboard.writeText((agentCwd || gitContext?.cwd)!)}
+                    className="mt-1 w-full text-left font-mono text-xs bg-muted/50 border border-border/50 rounded-md px-3 py-2 text-foreground hover:bg-muted transition-colors cursor-pointer break-all"
+                    title="Click to copy"
+                  >
+                    {agentCwd || gitContext?.cwd}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground/60">Automatically removed when this review session ends.</p>
+              </div>
+            }
+            variant="info"
+          />
+        )}
+
         {/* No annotations dialog */}
         <ConfirmDialog
           isOpen={showNoAnnotationsDialog}
@@ -1792,6 +1881,22 @@ const ReviewApp: React.FC = () => {
           showCancel
         />
 
+        <ConfirmDialog
+          isOpen={showExitWarning}
+          onClose={() => setShowExitWarning(false)}
+          onConfirm={() => {
+            setShowExitWarning(false);
+            handleExit();
+          }}
+          title="Annotations Won't Be Sent"
+          message={<>You have {totalAnnotationCount} annotation{totalAnnotationCount !== 1 ? 's' : ''} that will be lost if you close.</>}
+          subMessage="To send your feedback, use Send Feedback instead."
+          confirmText="Close Anyway"
+          cancelText="Cancel"
+          variant="warning"
+          showCancel
+        />
+
         {/* AI setup dialog — first-run only */}
         <AISetupDialog
           isOpen={showAISetup}
@@ -1802,18 +1907,24 @@ const ReviewApp: React.FC = () => {
           }}
         />
 
-        {/* Completion overlay - shown after approve/feedback */}
+        {/* Completion overlay - shown after approve/feedback/exit */}
         <CompletionOverlay
           submitted={submitted}
-          title={submitted === 'approved' ? 'Changes Approved' : 'Feedback Sent'}
+          title={
+            submitted === 'approved' ? 'Changes Approved'
+            : submitted === 'exited' ? 'Session Closed'
+            : 'Feedback Sent'
+          }
           subtitle={
-            platformMode
-              ? submitted === 'approved'
-                ? `Your approval was submitted to ${platformLabel}.`
-                : `Your feedback was submitted to ${platformLabel}.`
-              : submitted === 'approved'
-                ? `${getAgentName(origin)} will proceed with the changes.`
-                : `${getAgentName(origin)} will address your review feedback.`
+            submitted === 'exited'
+              ? 'Review session closed without feedback.'
+              : platformMode
+                ? submitted === 'approved'
+                  ? `Your approval was submitted to ${platformLabel}.`
+                  : `Your feedback was submitted to ${platformLabel}.`
+                : submitted === 'approved'
+                  ? `${getAgentName(origin)} will proceed with the changes.`
+                  : `${getAgentName(origin)} will address your review feedback.`
           }
           agentLabel={getAgentName(origin)}
         />
@@ -1880,6 +1991,7 @@ const ReviewApp: React.FC = () => {
           </div>
         )}
       </div>
+    </JobLogsProvider>
     </ReviewStateProvider>
     </ThemeProvider>
   );
